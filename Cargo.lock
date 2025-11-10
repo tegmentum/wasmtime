@@ -4658,6 +4658,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "libc",
+ "libloading",
  "libtest-mimic",
  "listenfd",
  "log",

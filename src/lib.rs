@@ -11,3 +11,6 @@ pub(crate) mod common;
 
 #[cfg(feature = "component-model")]
 pub(crate) mod host_bundle;
+
+#[cfg(feature = "component-model")]
+pub(crate) mod host_adapter;

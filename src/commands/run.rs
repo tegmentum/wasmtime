@@ -19,6 +19,9 @@ use wasmtime_wasi::{WasiCtxView, WasiView};
 #[cfg(feature = "component-model")]
 use crate::host_bundle::HostBundles;
 
+#[cfg(feature = "component-model")]
+use crate::host_adapter::HostAdapterRegistry;
+
 #[cfg(feature = "wasi-config")]
 use wasmtime_wasi_config::{WasiConfig, WasiConfigVariables};
 #[cfg(feature = "wasi-http")]
@@ -261,39 +264,38 @@ impl RunCommand {
         let mut store = Store::new(&engine, host);
         self.populate_with_wasi(&mut linker, &mut store, &main)?;
 
-        // Load and validate host bundles
+        // Load and link host bundles
         #[cfg(feature = "component-model")]
         if !self.host_bundles.is_empty() || self.host_config.is_some() {
             let host_bundles = self.load_host_bundles()?;
 
             // Only try to load host bundles for components, not core modules
-            if let CliLinker::Component(_linker) = &mut linker {
-                // TODO: Integrate host bundles into the component linker
-                // This requires:
-                // 1. Loading the WIT definitions from host_bundle.wit_path()
-                // 2. Dynamically loading the native library from host_bundle.lib_path()
-                // 3. Registering the host functions with the linker
-                //
-                // For now, we validate that the bundles can be loaded but don't
-                // yet have the infrastructure to dynamically link them.
+            if let CliLinker::Component(component_linker) = &mut linker {
+                let mut registry = HostAdapterRegistry::new();
 
+                // Load all bundles into the registry
                 for bundle in host_bundles.bundles() {
-                    eprintln!("Loaded host bundle '{}' from {}",
-                             bundle.name(),
-                             bundle.bundle_path.display());
-                    eprintln!("  WIT: {}", bundle.wit_path().display());
-                    eprintln!("  Lib: {}", bundle.lib_path().display());
+                    registry.register_bundle(bundle.clone())
+                        .with_context(|| format!("Failed to register host bundle '{}'", bundle.name()))?;
                 }
 
-                // TODO: Actual integration would look something like:
-                // 1. Use wasmtime::component::bindgen! or similar to load WIT
-                // 2. Use libloading or similar to dlopen the native library
-                // 3. Link the host functions to the component linker
-                //
-                // This is a significant feature that requires:
-                // - A stable ABI for host implementations
-                // - A way to discover and call functions from the dynamic library
-                // - Proper lifetime management of the loaded libraries
+                // Link all adapters to the component linker
+                // Note: This currently only validates and loads the libraries
+                // Full WIT->linker integration requires runtime WIT parsing and
+                // ABI bridging, which is complex and would need either:
+                // 1. wit-parser + custom ABI generation at runtime
+                // 2. Build-time bindgen with a plugin architecture
+                registry.link_all(component_linker)
+                    .context("Failed to link host adapters to component linker")?;
+
+                eprintln!();
+                eprintln!("[Host Bundles] Registered {} host adapter(s)", registry.adapters().len());
+                for adapter in registry.adapters() {
+                    eprintln!("[Host Bundles]   - {} (WIT: {})",
+                             adapter.name(),
+                             adapter.wit_path().display());
+                }
+                eprintln!();
             }
         }
 

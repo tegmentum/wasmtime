@@ -70,6 +70,7 @@ serde = { workspace = true }
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+libloading = { version = "0.8", optional = true }
 wasmparser = { workspace = true }
 tracing = { workspace = true }
 log = { workspace = true }
@@ -531,6 +532,7 @@ component-model = [
   "wasmtime-wast?/component-model",
   "wasmtime-cli-flags/component-model",
   "wasmtime-wizer?/component-model",
+  "dep:libloading",
 ]
 wat = ["dep:wat", "wasmtime/wat"]
 cache = ["dep:wasmtime-cache", "wasmtime-cli-flags/cache"]
