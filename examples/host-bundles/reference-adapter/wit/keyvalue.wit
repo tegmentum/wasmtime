@@ -1,0 +1,36 @@
+// Simple key-value store interface for testing host adapters
+package keyvalue:store@0.1.0;
+
+/// Key-value storage interface
+interface store {
+    /// Store a value with a key
+    /// Returns error if key already exists
+    set: func(key: string, value: string) -> result<_, string>;
+
+    /// Retrieve a value by key
+    /// Returns none if key doesn't exist
+    get: func(key: string) -> option<string>;
+
+    /// Delete a key-value pair
+    /// Returns error if key doesn't exist
+    delete: func(key: string) -> result<_, string>;
+
+    /// List all keys in the store
+    list-keys: func() -> list<string>;
+
+    /// Check if a key exists
+    exists: func(key: string) -> bool;
+
+    /// Clear all entries
+    clear: func();
+}
+
+/// World for components that import the key-value store
+world keyvalue-client {
+    import store;
+}
+
+/// World for hosts that export the key-value store
+world keyvalue-host {
+    export store;
+}

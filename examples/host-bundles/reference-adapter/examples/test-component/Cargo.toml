@@ -1,0 +1,15 @@
+[package]
+name = "keyvalue-test-component"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wit-bindgen = "0.38"
+serde = { version = "1", features = ["derive"] }
+
+[lib]
+crate-type = ["cdylib"]
+
+[[bin]]
+name = "test-component"
+path = "src/main.rs"

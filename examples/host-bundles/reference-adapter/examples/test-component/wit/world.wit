@@ -1,0 +1,13 @@
+package test:component@0.1.0;
+
+interface test {
+    run-tests: func() -> string;
+}
+
+world test-runner {
+    // Import the host-provided key-value store
+    import keyvalue:store/store@0.1.0;
+
+    // Export our test interface
+    export test;
+}
