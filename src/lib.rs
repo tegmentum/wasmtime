@@ -8,3 +8,6 @@ pub mod commands;
 
 #[cfg(any(feature = "run", feature = "wizer"))]
 pub(crate) mod common;
+
+#[cfg(feature = "component-model")]
+pub(crate) mod host_bundle;

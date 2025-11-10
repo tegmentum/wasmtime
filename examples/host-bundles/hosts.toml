@@ -1,0 +1,25 @@
+# Example host manifest configuration
+
+[global]
+# Search paths for host bundles (relative to this manifest or absolute)
+search_paths = [".", "./example_host"]
+
+# Example 1: Reference a bundle by name
+[[host]]
+name = "example"
+bundle = "example_host"
+
+# Example 2: Explicit paths (useful for system-installed hosts)
+# [[host]]
+# name = "duckdb"
+# wit = "/usr/local/share/wasmtime/hosts/duckdb/wit/duckdb-extension"
+# lib = "/usr/local/share/wasmtime/hosts/duckdb/lib/libduckdb_host.so"
+
+# Example 3: Multiple instances of the same interface
+# [[host]]
+# name = "database-primary"
+# bundle = "duckdb_host"
+#
+# [[host]]
+# name = "database-secondary"
+# bundle = "duckdb_host"

@@ -16,6 +16,9 @@ use wasi_common::sync::{Dir, TcpListener, WasiCtxBuilder, ambient_authority};
 use wasmtime::{Engine, Func, Module, Store, StoreLimits, Val, ValType};
 use wasmtime_wasi::{WasiCtxView, WasiView};
 
+#[cfg(feature = "component-model")]
+use crate::host_bundle::HostBundles;
+
 #[cfg(feature = "wasi-config")]
 use wasmtime_wasi_config::{WasiConfig, WasiConfigVariables};
 #[cfg(feature = "wasi-http")]
@@ -62,6 +65,46 @@ pub struct RunCommand {
     /// without needing to rename the original wasm binary.
     #[arg(long)]
     pub argv0: Option<String>,
+
+    /// Load a host implementation bundle.
+    ///
+    /// A host bundle is a directory containing a host.toml configuration file,
+    /// WIT definitions, and a native library implementing the host interface.
+    /// Multiple bundles can be specified by using this flag multiple times.
+    ///
+    /// Example bundle structure:
+    ///   duckdb_host/
+    ///     host.toml
+    ///     wit/
+    ///       duckdb-extension/
+    ///         runtime.wit
+    ///     lib/
+    ///       libduckdb_host.dylib
+    #[cfg(feature = "component-model")]
+    #[arg(long = "host-bundle", value_name = "BUNDLE_PATH")]
+    pub host_bundles: Vec<PathBuf>,
+
+    /// Load host implementations from a manifest file.
+    ///
+    /// A host manifest (hosts.toml) allows configuring multiple host bundles
+    /// from a single configuration file with search paths and can mix bundle
+    /// references with explicit WIT/lib paths.
+    ///
+    /// Example manifest:
+    ///   [global]
+    ///   search_paths = ["./hosts", "/usr/local/share/wasmtime/hosts"]
+    ///
+    ///   [[host]]
+    ///   name = "duckdb"
+    ///   bundle = "duckdb_host"
+    ///
+    ///   [[host]]
+    ///   name = "pkcs11"
+    ///   wit = "/opt/pkcs11-host/pkcs11.wit"
+    ///   lib = "/opt/pkcs11-host/libpkcs11_host.dylib"
+    #[cfg(feature = "component-model")]
+    #[arg(long = "host-config", value_name = "MANIFEST_PATH")]
+    pub host_config: Option<PathBuf>,
 
     /// The WebAssembly module to run and arguments to pass to it.
     ///
@@ -147,6 +190,26 @@ impl RunCommand {
         Engine::new(&config)
     }
 
+    /// Load host bundles from CLI flags
+    #[cfg(feature = "component-model")]
+    fn load_host_bundles(&self) -> Result<HostBundles> {
+        let mut bundles = HostBundles::new();
+
+        // Load bundles from --host-bundle flags
+        for bundle_path in &self.host_bundles {
+            bundles.add_bundle_dir(bundle_path)
+                .with_context(|| format!("Failed to load host bundle from {}", bundle_path.display()))?;
+        }
+
+        // Load bundles from --host-config manifest
+        if let Some(manifest_path) = &self.host_config {
+            bundles.add_manifest(manifest_path)
+                .with_context(|| format!("Failed to load host manifest from {}", manifest_path.display()))?;
+        }
+
+        Ok(bundles)
+    }
+
     /// Populatse a new `Store` and `CliLinker` with the configuration in this
     /// command.
     ///
@@ -197,6 +260,42 @@ impl RunCommand {
 
         let mut store = Store::new(&engine, host);
         self.populate_with_wasi(&mut linker, &mut store, &main)?;
+
+        // Load and validate host bundles
+        #[cfg(feature = "component-model")]
+        if !self.host_bundles.is_empty() || self.host_config.is_some() {
+            let host_bundles = self.load_host_bundles()?;
+
+            // Only try to load host bundles for components, not core modules
+            if let CliLinker::Component(_linker) = &mut linker {
+                // TODO: Integrate host bundles into the component linker
+                // This requires:
+                // 1. Loading the WIT definitions from host_bundle.wit_path()
+                // 2. Dynamically loading the native library from host_bundle.lib_path()
+                // 3. Registering the host functions with the linker
+                //
+                // For now, we validate that the bundles can be loaded but don't
+                // yet have the infrastructure to dynamically link them.
+
+                for bundle in host_bundles.bundles() {
+                    eprintln!("Loaded host bundle '{}' from {}",
+                             bundle.name(),
+                             bundle.bundle_path.display());
+                    eprintln!("  WIT: {}", bundle.wit_path().display());
+                    eprintln!("  Lib: {}", bundle.lib_path().display());
+                }
+
+                // TODO: Actual integration would look something like:
+                // 1. Use wasmtime::component::bindgen! or similar to load WIT
+                // 2. Use libloading or similar to dlopen the native library
+                // 3. Link the host functions to the component linker
+                //
+                // This is a significant feature that requires:
+                // - A stable ABI for host implementations
+                // - A way to discover and call functions from the dynamic library
+                // - Proper lifetime management of the loaded libraries
+            }
+        }
 
         store.data_mut().limits = self.run.store_limits();
         store.limiter(|t| &mut t.limits);

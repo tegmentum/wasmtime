@@ -1,0 +1,4 @@
+[host]
+name = "example"
+lib = "lib/libexample_host.so"
+wit = "wit/example-interface"

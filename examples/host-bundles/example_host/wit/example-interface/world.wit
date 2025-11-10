@@ -1,0 +1,17 @@
+package example:interface@1.0.0;
+
+/// Example host interface for demonstration
+interface runtime {
+  /// Say hello to someone
+  greet: func(name: string) -> string;
+
+  /// Add two numbers
+  add: func(a: u32, b: u32) -> u32;
+
+  /// Get a configuration value
+  get-config: func(key: string) -> result<string, string>;
+}
+
+world example-runtime {
+  import runtime;
+}
