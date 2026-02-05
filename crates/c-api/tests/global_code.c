@@ -10,6 +10,10 @@
 #include <string.h>
 
 typedef struct {
+  // Ownership contract for held items:
+  // - `engine` and `module` are paired and owned by this entry.
+  // - each pointer stored here must be deleted exactly once.
+  // - `module_start` is diagnostic only and never dereferenced.
   wasm_engine_t *engine;
   wasmtime_module_t *module;
   uintptr_t module_start;
@@ -20,6 +24,16 @@ typedef struct {
   size_t len;
   size_t cap;
 } held_list_t;
+
+// Repro contract for all test paths below:
+// - every successful `wasmtime_module_new` is matched by exactly one
+//   `wasmtime_module_delete`.
+// - every created `wasm_engine_t` is matched by exactly one
+//   `wasm_engine_delete`.
+// - no module handle is shared across threads; each thread owns and drops only
+//   modules it created.
+// - the only intentional cross-thread interaction is process-global runtime
+//   state exercised by concurrent create/drop activity.
 
 static void held_list_push(held_list_t *list, wasm_engine_t *engine,
                            wasmtime_module_t *module,
@@ -276,6 +290,9 @@ typedef struct {
 static void *thread_pressure(void *arg) {
   thread_ctx_t *ctx = (thread_ctx_t *)arg;
   held_list_t held = {0};
+
+  // Each thread keeps ownership of its own held list; no cross-thread
+  // transfers occur.
 
   for (size_t i = 0; i < 1000; i++) {
     wasm_engine_t *engine = new_engine_with_signals_disabled();
