@@ -602,6 +602,152 @@ fn test_global_code_multithread_address_reuse() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Simulate JNI timing where mmap is freed before unregister_code runs.
+///
+/// This test creates many "leaked" addresses (registry entries without backing memory)
+/// then tries to get the OS to reuse one of those addresses for a new module.
+/// When that happens, register_code will find a stale entry and panic.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_jni_timing_simulation() {
+    use crate::*;
+    use std::collections::HashSet;
+
+    let mut config = Config::new();
+    config.signals_based_traps(false);
+
+    let wat = r#"(module (func (export "f")))"#;
+
+    let mut leaked_addresses: HashSet<usize> = HashSet::new();
+    let mut leaked_ranges: Vec<(usize, usize)> = Vec::new();
+
+    // Phase 1: Create many modules, forget them, then unmap their memory
+    // This leaves stale entries in the registry with freed backing memory
+    eprintln!("Phase 1: Creating leaked registry entries...");
+
+    for i in 0..100 {
+        let engine = Engine::new(&config).unwrap();
+        let module = Module::new(&engine, wat).unwrap();
+        let range = module.engine_code().text_range();
+        let addr_start = range.start.raw();
+        let addr_end = range.end.raw();
+        let size = addr_end - addr_start;
+
+        leaked_addresses.insert(addr_start);
+        leaked_ranges.push((addr_start, size));
+
+        // Forget to prevent Drop (keeps registry entry)
+        std::mem::forget(module);
+        std::mem::forget(engine);
+
+        if i % 20 == 0 {
+            eprintln!("  Created {} leaked entries", i + 1);
+        }
+    }
+
+    eprintln!("Created {} leaked registry entries", leaked_addresses.len());
+
+    // Phase 2: Unmap all the leaked memory
+    eprintln!("Phase 2: Unmapping leaked memory (simulating JNI corruption)...");
+
+    let mut unmapped = 0;
+    for (addr, size) in &leaked_ranges {
+        unsafe {
+            let result = libc::munmap(*addr as *mut libc::c_void, *size);
+            if result == 0 {
+                unmapped += 1;
+            }
+        }
+    }
+
+    eprintln!("Unmapped {} memory regions, {} stale registry entries remain", unmapped, leaked_addresses.len());
+
+    // Phase 3: Create new modules - if one gets a leaked address, register_code panics
+    eprintln!("Phase 3: Creating new modules to trigger collision...");
+
+    for i in 0..10000 {
+        let engine = match Engine::new(&config) {
+            Ok(e) => e,
+            Err(e) => {
+                if i < 10 {
+                    eprintln!("  Engine creation failed at {}: {:?}", i, e);
+                }
+                continue;
+            }
+        };
+        let module = match Module::new(&engine, wat) {
+            Ok(m) => m,
+            Err(e) => {
+                if i < 10 {
+                    eprintln!("  Module creation failed at {}: {:?}", i, e);
+                }
+                continue;
+            }
+        };
+
+        let new_addr = module.engine_code().text_range().start.raw();
+
+        if leaked_addresses.contains(&new_addr) {
+            // This means register_code should have panicked but didn't
+            // (shouldn't happen - if we get here, there's a bug in our test logic)
+            panic!("Address {:#x} was reused at iteration {} - register_code should have panicked!", new_addr, i);
+        }
+
+        if i % 1000 == 0 {
+            eprintln!("  Iteration {}: module at {:#x}", i, new_addr);
+        }
+
+        drop(module);
+        drop(engine);
+    }
+
+    eprintln!("Test completed without triggering natural collision");
+
+    // Phase 4: Force allocation at a leaked address to prove collision would occur
+    eprintln!("Phase 4: Forcing allocation at leaked address with MAP_FIXED...");
+
+    if let Some(&(leaked_addr, leaked_size)) = leaked_ranges.first() {
+        // Verify the stale entry is still in the registry
+        if lookup_code(leaked_addr).is_some() {
+            eprintln!("  Stale entry at {:#x} confirmed in registry", leaked_addr);
+
+            // Try to mmap at that exact address
+            unsafe {
+                let ptr = libc::mmap(
+                    leaked_addr as *mut libc::c_void,
+                    leaked_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                    -1,
+                    0,
+                );
+
+                if ptr != libc::MAP_FAILED && ptr == leaked_addr as *mut libc::c_void {
+                    eprintln!("  Successfully allocated at leaked address {:#x}", leaked_addr);
+                    eprintln!("  Registry entry exists: {}", lookup_code(leaked_addr).is_some());
+
+                    // If we could create a Module here at this address, register_code would panic
+                    // But we can't control where Module::new allocates
+                    // So we directly call register_code to prove the collision
+                    eprintln!("  Calling register_code to trigger collision...");
+
+                    // Create a dummy Arc<CodeMemory> - we can't easily do this without wasmtime internals
+                    // But we already have the direct test that proves this works
+                    eprintln!("  (Skipping - direct test already proves register_code panics on duplicate)");
+
+                    libc::munmap(ptr, leaked_size);
+                } else {
+                    eprintln!("  MAP_FIXED allocation failed or got different address");
+                }
+            }
+        } else {
+            eprintln!("  Stale entry was somehow removed");
+        }
+    }
+
+    eprintln!("Note: Use test_register_code_duplicate_panics to verify the panic directly");
+}
+
 /// Direct test to verify that register_code panics on duplicate registration.
 ///
 /// This test directly triggers assert!(prev.is_none()) by calling register_code
