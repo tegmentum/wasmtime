@@ -426,6 +426,128 @@ fn test_global_code_unregisters_under_pressure() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Extreme pressure test with cross-thread collision detection.
+/// Tracks which addresses are currently "live" across ALL threads to detect
+/// if two threads ever hold the same address simultaneously.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_extreme_pressure_natural_collision() {
+    use crate::*;
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const THREADS: usize = 64;
+    const DURATION_SECS: u64 = 15;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let total_created = Arc::new(AtomicUsize::new(0));
+    let cross_thread_collisions = Arc::new(AtomicUsize::new(0));
+
+    // Global set of currently-live addresses across all threads
+    let live_addresses: Arc<Mutex<HashSet<usize>>> = Arc::new(Mutex::new(HashSet::new()));
+
+    eprintln!("=== EXTREME PRESSURE TEST (Cross-Thread Detection) ===");
+    eprintln!("Threads: {}, Duration: {}s", THREADS, DURATION_SECS);
+    eprintln!("Detecting if two threads ever hold the same address simultaneously");
+    eprintln!();
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|thread_id| {
+            let stop = Arc::clone(&stop);
+            let total_created = Arc::clone(&total_created);
+            let cross_thread_collisions = Arc::clone(&cross_thread_collisions);
+            let live_addresses = Arc::clone(&live_addresses);
+
+            thread::spawn(move || {
+                let mut config = Config::new();
+                config.signals_based_traps(false);
+
+                let wat = r#"(module (func (export "f")))"#;
+
+                while !stop.load(Ordering::Relaxed) {
+                    let engine = match Engine::new(&config) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+
+                    let module = match Module::new(&engine, wat) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+
+                    let addr = module.engine_code().text_range().start.raw();
+
+                    // Check if this address is already held by another thread
+                    {
+                        let mut live = live_addresses.lock().unwrap();
+                        if live.contains(&addr) {
+                            // CROSS-THREAD COLLISION! Two threads have same address!
+                            cross_thread_collisions.fetch_add(1, Ordering::Relaxed);
+                            eprintln!(
+                                "  !! CROSS-THREAD COLLISION: Thread {} got address {:#x} already held by another thread!",
+                                thread_id, addr
+                            );
+                        }
+                        live.insert(addr);
+                    }
+
+                    // Small delay to increase overlap window
+                    // (In production, work would happen here)
+
+                    // Remove from live set before dropping
+                    {
+                        let mut live = live_addresses.lock().unwrap();
+                        live.remove(&addr);
+                    }
+
+                    drop(module);
+                    drop(engine);
+
+                    total_created.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+
+    // Run with progress updates
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(DURATION_SECS) {
+        thread::sleep(Duration::from_secs(1));
+        let created = total_created.load(Ordering::Relaxed);
+        let collisions = cross_thread_collisions.load(Ordering::Relaxed);
+        eprintln!(
+            "  Progress: {} modules, {} cross-thread collisions ({:.0}/sec)",
+            created,
+            collisions,
+            created as f64 / start.elapsed().as_secs_f64()
+        );
+    }
+
+    stop.store(true, Ordering::Relaxed);
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    let total = total_created.load(Ordering::Relaxed);
+    let collisions = cross_thread_collisions.load(Ordering::Relaxed);
+
+    eprintln!();
+    eprintln!("=== RESULTS ===");
+    eprintln!("Total modules created: {}", total);
+    eprintln!("Cross-thread collisions: {}", collisions);
+
+    if collisions > 0 {
+        eprintln!("COLLISION DETECTED! This proves two threads can hold same address.");
+        eprintln!("If register_code ran during this overlap, it would panic.");
+    } else {
+        eprintln!("No cross-thread collisions - Rust's synchronous Drop prevents overlap.");
+    }
+}
+
 /// Aggressive test designed to trigger wasmtime's assert!(prev.is_none()) in register_code().
 ///
 /// This test attempts to cause the actual SIGABRT by:
