@@ -42,6 +42,7 @@ static void held_list_push(held_list_t *list, wasm_engine_t *engine,
 }
 
 static bool address_is_mapped(uintptr_t addr) {
+#ifdef __linux__
   FILE *maps = fopen("/proc/self/maps", "r");
   if (!maps) {
     fprintf(stderr, "failed to open /proc/self/maps\n");
@@ -62,6 +63,10 @@ static bool address_is_mapped(uintptr_t addr) {
 
   fclose(maps);
   return false;
+#else
+  (void)addr;
+  return false;
+#endif
 }
 
 static uintptr_t module_start(wasmtime_module_t *module) {
@@ -76,19 +81,29 @@ static uintptr_t module_start(wasmtime_module_t *module) {
 }
 
 static void assert_mapped(uintptr_t addr, const char *context) {
+#ifdef __linux__
   if (!address_is_mapped(addr)) {
     fprintf(stderr, "%s: expected mapped address %#lx\n", context,
             (unsigned long)addr);
     exit(1);
   }
+#else
+  (void)addr;
+  (void)context;
+#endif
 }
 
 static void assert_unmapped(uintptr_t addr, const char *context) {
+#ifdef __linux__
   if (address_is_mapped(addr)) {
     fprintf(stderr, "%s: expected unmapped address %#lx\n", context,
             (unsigned long)addr);
     exit(1);
   }
+#else
+  (void)addr;
+  (void)context;
+#endif
 }
 
 static bool held_list_pop(held_list_t *list, held_module_t *out) {
