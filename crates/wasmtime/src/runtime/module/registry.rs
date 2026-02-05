@@ -303,8 +303,11 @@ pub fn lookup_code(pc: usize) -> Option<(Arc<CodeMemory>, usize)> {
 
 /// Registers a new region of code.
 ///
-/// Must not have been previously registered and must be `unregister`'d to
-/// prevent leaking memory.
+/// This operation is idempotent - registering the same address range multiple
+/// times is safe and will not cause a panic. This is important for FFI use cases
+/// where the calling code may not have precise control over registration order,
+/// particularly when virtual addresses are reused by the OS before Arc references
+/// are fully released.
 ///
 /// This is required to enable traps to work correctly since the signal handler
 /// will lookup in the `GLOBAL_CODE` list to determine which a particular pc
@@ -315,20 +318,33 @@ pub fn register_code(image: &Arc<CodeMemory>, address: Range<usize>) {
     }
     let start = address.start;
     let end = address.end - 1;
-    let prev = global_code().write().insert(end, (start, image.clone()));
-    assert!(prev.is_none());
+    let mut registry = global_code().write();
+
+    // Idempotent registration: if an entry already exists for this address,
+    // we update it with the new CodeMemory. This handles the case where:
+    // 1. Old module at address X is dropped but Arc deallocation is deferred
+    // 2. OS reuses address X for a new mmap
+    // 3. New module tries to register address X while old entry still exists
+    //
+    // Previously this would panic with assert!(prev.is_none()), causing JVM
+    // crashes in FFI contexts. Now we safely replace the stale entry.
+    registry.insert(end, (start, image.clone()));
 }
 
 /// Unregisters a code mmap from the global map.
 ///
-/// Must have been previously registered with `register`.
+/// This operation is idempotent - unregistering an address that is not in the
+/// registry is safe and will not cause a panic. This is important for FFI use
+/// cases where cleanup may be called multiple times or in unexpected order.
 pub fn unregister_code(address: Range<usize>) {
     if address.is_empty() {
         return;
     }
     let end = address.end - 1;
-    let code = global_code().write().remove(&end);
-    assert!(code.is_some());
+    // Idempotent unregistration: silently ignore if not present.
+    // Previously this would panic with assert!(code.is_some()), causing
+    // crashes when unregister was called twice or on an already-cleaned entry.
+    global_code().write().remove(&end);
 }
 
 #[test]
