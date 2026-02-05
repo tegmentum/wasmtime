@@ -30,8 +30,10 @@ typedef struct {
 //   `wasmtime_module_delete`.
 // - every created `wasm_engine_t` is matched by exactly one
 //   `wasm_engine_delete`.
+// - Each wasmtime_*_delete is called exactly once.
 // - no module handle is shared across threads; each thread owns and drops only
 //   modules it created.
+// - No handles are used after delete.
 // - the only intentional cross-thread interaction is process-global runtime
 //   state exercised by concurrent create/drop activity.
 
@@ -327,6 +329,8 @@ static void *thread_pressure(void *arg) {
   for (size_t i = 0; i < held.len; i++) {
     assert_mapped(held.items[i].module_start, "threaded final pre-drop");
   }
+  // Threads join before cleanup in the parent; this thread only cleans up the
+  // handles it owns.
   held_list_drop_all(&held);
   return NULL;
 }
@@ -351,6 +355,8 @@ static void test_unregisters_under_threaded_pressure(void) {
   for (size_t i = 0; i < 4; i++) {
     pthread_join(threads[i], NULL);
   }
+
+  // Threads join before cleanup.
 }
 
 int main(void) {
