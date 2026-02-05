@@ -378,3 +378,151 @@ fn test_frame_info() -> Result<(), anyhow::Error> {
     }
     Ok(())
 }
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_global_code_unregisters_under_pressure() -> Result<(), anyhow::Error> {
+    use crate::*;
+
+    let mut config = Config::new();
+    config.signals_based_traps(false);
+
+    let wat = r#"(module
+        (memory (export "mem") 1)
+        (data (i32.const 0) "pressure")
+        (func (export "test") (result i32) i32.const 42)
+    )"#;
+
+    let mut held_modules: Vec<Module> = Vec::new();
+
+    for i in 0..1000 {
+        let engine = Engine::new(&config)?;
+        let module = Module::new(&engine, wat)?;
+        let pc = module.engine_code().text_range().start.raw();
+
+        assert!(lookup_code(pc).is_some());
+
+        if i % 3 == 0 {
+            held_modules.push(module);
+        } else {
+            drop(module);
+            assert!(lookup_code(pc).is_none());
+        }
+
+        if i % 10 == 0 && !held_modules.is_empty() {
+            let dropped = held_modules.pop().unwrap();
+            let dropped_pc = dropped.engine_code().text_range().start.raw();
+            drop(dropped);
+            assert!(lookup_code(dropped_pc).is_none());
+        }
+    }
+
+    for module in held_modules {
+        let pc = module.engine_code().text_range().start.raw();
+        drop(module);
+        assert!(lookup_code(pc).is_none());
+    }
+
+    Ok(())
+}
+
+/// Multi-threaded version of the pressure test to trigger address reuse race condition.
+/// This test attempts to reproduce the GLOBAL_CODE registry crash where:
+/// 1. Thread A drops a module (Arc deallocation may be deferred)
+/// 2. Thread B allocates a new module at the same address
+/// 3. Thread B's register_code() finds the address already in registry -> SIGABRT
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_global_code_multithread_address_reuse() -> Result<(), anyhow::Error> {
+    use crate::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+
+    const THREADS: usize = 8;
+    const ITERATIONS: usize = 500;
+
+    let completed = Arc::new(AtomicUsize::new(0));
+    let errors = Arc::new(AtomicUsize::new(0));
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|thread_id| {
+            let completed = Arc::clone(&completed);
+            let errors = Arc::clone(&errors);
+            thread::spawn(move || {
+                let mut config = Config::new();
+                config.signals_based_traps(false);
+
+                let wat = r#"(module
+                    (memory (export "mem") 1)
+                    (func (export "test") (result i32) i32.const 42)
+                )"#;
+
+                let mut held: Vec<(Engine, Module)> = Vec::new();
+
+                for i in 0..ITERATIONS {
+                    let engine = match Engine::new(&config) {
+                        Ok(e) => e,
+                        Err(_) => {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+
+                    let module = match Module::new(&engine, wat) {
+                        Ok(m) => m,
+                        Err(_) => {
+                            errors.fetch_add(1, Ordering::Relaxed);
+                            continue;
+                        }
+                    };
+
+                    let pc = module.engine_code().text_range().start.raw();
+
+                    // Verify registration
+                    if lookup_code(pc).is_none() {
+                        eprintln!(
+                            "Thread {} iter {}: lookup_code({:#x}) returned None after creation!",
+                            thread_id, i, pc
+                        );
+                        errors.fetch_add(1, Ordering::Relaxed);
+                    }
+
+                    // Hold some, drop others to create pressure
+                    if i % 5 == 0 {
+                        held.push((engine, module));
+                    } else {
+                        // Immediate drop
+                        drop(module);
+                        drop(engine);
+                    }
+
+                    // Periodically release held modules
+                    if i % 20 == 0 && !held.is_empty() {
+                        let count = held.len() / 2;
+                        for _ in 0..count {
+                            held.pop();
+                        }
+                    }
+                }
+
+                completed.fetch_add(ITERATIONS, Ordering::SeqCst);
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().expect("Thread panicked");
+    }
+
+    let total = completed.load(Ordering::SeqCst);
+    let error_count = errors.load(Ordering::Relaxed);
+    eprintln!(
+        "Multithread test completed: {} iterations, {} errors",
+        total, error_count
+    );
+
+    assert_eq!(error_count, 0, "Encountered {} errors during test", error_count);
+
+    Ok(())
+}
