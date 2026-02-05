@@ -83,6 +83,8 @@ static bool address_is_mapped(uintptr_t addr) {
 #endif
 }
 
+static size_t linux_unmapped_mismatches = 0;
+
 static uintptr_t module_start(wasmtime_module_t *module) {
   void *start = NULL;
   void *end = NULL;
@@ -107,12 +109,14 @@ static void assert_mapped(uintptr_t addr, const char *context) {
 #endif
 }
 
-static void assert_unmapped(uintptr_t addr, const char *context) {
+static void note_unmapped_evidence(uintptr_t addr, const char *context) {
 #ifdef __linux__
   if (address_is_mapped(addr)) {
-    fprintf(stderr, "%s: expected unmapped address %#lx\n", context,
-            (unsigned long)addr);
-    exit(1);
+    linux_unmapped_mismatches++;
+    fprintf(stderr,
+            "%s: expected unmapped address after drop, got mapped %#lx "
+            "(linux /proc/self/maps evidence)\n",
+            context, (unsigned long)addr);
   }
 #else
   (void)addr;
@@ -198,7 +202,7 @@ static void test_unregisters_on_module_drop(void) {
     assert_mapped(pc, "on_module_drop pre-drop");
     wasmtime_module_delete(module);
     wasm_engine_delete(engine);
-    assert_unmapped(pc, "on_module_drop post-drop");
+    note_unmapped_evidence(pc, "on_module_drop post-drop");
   }
 }
 
@@ -214,7 +218,7 @@ static void test_unregisters_same_module(void) {
     assert_mapped(pc, "same_module pre-drop");
     wasmtime_module_delete(module);
     wasm_engine_delete(engine);
-    assert_unmapped(pc, "same_module post-drop");
+    note_unmapped_evidence(pc, "same_module post-drop");
 
     if (i % 100 == 0) {
       fprintf(stderr, "Iteration %zu\n", i);
@@ -233,7 +237,7 @@ static void test_unregisters_same_engine(void) {
     uintptr_t pc = module_start(module);
     assert_mapped(pc, "same_engine pre-drop");
     wasmtime_module_delete(module);
-    assert_unmapped(pc, "same_engine post-drop");
+    note_unmapped_evidence(pc, "same_engine post-drop");
 
     if (i % 100 == 0) {
       fprintf(stderr, "Iteration %zu\n", i);
@@ -262,7 +266,7 @@ static void test_unregisters_under_pressure(void) {
     } else {
       wasmtime_module_delete(module);
       wasm_engine_delete(engine);
-      assert_unmapped(pc, "under_pressure post-drop");
+      note_unmapped_evidence(pc, "under_pressure post-drop");
     }
 
     if (i % 10 == 0) {
@@ -270,8 +274,8 @@ static void test_unregisters_under_pressure(void) {
       if (held_list_pop(&held, &dropped)) {
         wasmtime_module_delete(dropped.module);
         wasm_engine_delete(dropped.engine);
-        assert_unmapped(dropped.module_start,
-                        "under_pressure delayed post-drop");
+        note_unmapped_evidence(dropped.module_start,
+                               "under_pressure delayed post-drop");
       }
     }
   }
@@ -306,7 +310,7 @@ static void *thread_pressure(void *arg) {
     } else {
       wasmtime_module_delete(module);
       wasm_engine_delete(engine);
-      assert_unmapped(pc, "threaded post-drop");
+      note_unmapped_evidence(pc, "threaded post-drop");
     }
 
     if (i % 25 == 0) {
@@ -314,7 +318,8 @@ static void *thread_pressure(void *arg) {
       if (held_list_pop(&held, &dropped)) {
         wasmtime_module_delete(dropped.module);
         wasm_engine_delete(dropped.engine);
-        assert_unmapped(dropped.module_start, "threaded delayed post-drop");
+        note_unmapped_evidence(dropped.module_start,
+                               "threaded delayed post-drop");
       }
     }
   }
@@ -354,5 +359,14 @@ int main(void) {
   test_unregisters_same_engine();
   test_unregisters_under_pressure();
   test_unregisters_under_threaded_pressure();
+#ifdef __linux__
+  if (linux_unmapped_mismatches > 0) {
+    fprintf(stderr,
+            "stable condition failed: expected 0 post-drop mapped addresses, "
+            "got %zu (linux /proc/self/maps extra evidence)\n",
+            linux_unmapped_mismatches);
+    return 1;
+  }
+#endif
   return 0;
 }
