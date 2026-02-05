@@ -602,6 +602,65 @@ fn test_global_code_multithread_address_reuse() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Direct test to verify that register_code panics on duplicate registration.
+///
+/// This test directly triggers assert!(prev.is_none()) by calling register_code
+/// twice with the same address range. This simulates what happens when the OS
+/// reuses a virtual address before the old registry entry is removed.
+#[test]
+#[cfg_attr(miri, ignore)]
+#[should_panic(expected = "prev.is_none()")]
+fn test_register_code_duplicate_panics() {
+    use crate::*;
+
+    let mut config = Config::new();
+    config.signals_based_traps(false);
+
+    let wat = r#"(module (func (export "f")))"#;
+
+    let engine = Engine::new(&config).unwrap();
+    let module = Module::new(&engine, wat).unwrap();
+
+    // Get the address range from engine_code
+    let text_range = module.engine_code().text_range();
+    let address_range = text_range.start.raw()..text_range.end.raw();
+
+    eprintln!("Module registered at address range {:?}", address_range);
+
+    // Lookup the existing entry to get the Arc<CodeMemory>
+    let (code_memory, _offset) = lookup_code(address_range.start).expect("Module should be registered");
+
+    eprintln!("Attempting duplicate registration - this should panic with 'prev.is_none()'...");
+
+    // Attempt to register the same address again - this MUST panic
+    // This simulates the race condition where address is reused before unregister
+    register_code(&code_memory, address_range);
+
+    // Should never reach here
+    unreachable!("register_code should have panicked on duplicate registration");
+}
+
+/// Direct test to verify that unregister_code panics on missing registration.
+///
+/// This test directly triggers assert!(code.is_some()) by calling unregister_code
+/// with an address that was never registered. This simulates what happens when
+/// unregistration is called twice (e.g., due to double-free or race condition).
+#[test]
+#[cfg_attr(miri, ignore)]
+#[should_panic(expected = "code.is_some()")]
+fn test_unregister_code_missing_panics() {
+    // Use a fake address range that's definitely not registered
+    let fake_range = 0xDEADBEEF0000..0xDEADBEEF1000;
+
+    eprintln!("Attempting to unregister non-existent address range {:?}", fake_range);
+    eprintln!("This should panic with 'code.is_some()'...");
+
+    // This MUST panic because the address was never registered
+    unregister_code(fake_range);
+
+    unreachable!("unregister_code should have panicked on missing registration");
+}
+
 /// Producer/consumer test to maximize cross-thread timing for register_code collision.
 ///
 /// Producers create modules and send them to a channel.
