@@ -426,6 +426,81 @@ fn test_global_code_unregisters_under_pressure() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Aggressive test designed to trigger wasmtime's assert!(prev.is_none()) in register_code().
+///
+/// This test attempts to cause the actual SIGABRT by:
+/// 1. Creating modules and immediately dropping them (to free addresses)
+/// 2. Having other threads rapidly create new modules (hoping for address reuse)
+/// 3. If a new module gets an address still in the registry -> SIGABRT
+///
+/// The race window is: between when OS reuses an address and when the old
+/// entry is removed from GLOBAL_CODE registry.
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_global_code_register_collision() -> Result<(), anyhow::Error> {
+    use crate::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    const THREADS: usize = 16;
+    const DURATION_SECS: u64 = 3;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let created = Arc::new(AtomicUsize::new(0));
+
+    eprintln!("Starting register collision test - this may SIGABRT if bug is triggered");
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|_thread_id| {
+            let stop = Arc::clone(&stop);
+            let created = Arc::clone(&created);
+            thread::spawn(move || {
+                let mut config = Config::new();
+                config.signals_based_traps(false);
+
+                // Minimal module to reduce compilation overhead
+                let wat = r#"(module (func (export "f")))"#;
+
+                while !stop.load(Ordering::Relaxed) {
+                    // Rapidly create and destroy - no holding references
+                    let engine = match Engine::new(&config) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+
+                    let module = match Module::new(&engine, wat) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+
+                    // Immediate drop to free address for reuse
+                    drop(module);
+                    drop(engine);
+
+                    created.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+
+    // Run for specified duration
+    thread::sleep(Duration::from_secs(DURATION_SECS));
+    stop.store(true, Ordering::Relaxed);
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+
+    eprintln!(
+        "Register collision test completed: {} modules created without SIGABRT",
+        created.load(Ordering::SeqCst)
+    );
+
+    Ok(())
+}
+
 /// Multi-threaded version of the pressure test to trigger address reuse race condition.
 /// This test attempts to reproduce the GLOBAL_CODE registry crash where:
 /// 1. Thread A drops a module (Arc deallocation may be deferred)
@@ -523,6 +598,121 @@ fn test_global_code_multithread_address_reuse() -> Result<(), anyhow::Error> {
     );
 
     assert_eq!(error_count, 0, "Encountered {} errors during test", error_count);
+
+    Ok(())
+}
+
+/// Producer/consumer test to maximize cross-thread timing for register_code collision.
+///
+/// Producers create modules and send them to a channel.
+/// Consumers receive and immediately drop them.
+/// Meanwhile, more producers are creating new modules.
+///
+/// This pattern maximizes the chance that:
+/// 1. Consumer drops module at address X
+/// 2. OS reuses address X for a producer's new module
+/// 3. Producer's register_code() finds X still in registry -> SIGABRT
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_global_code_producer_consumer_collision() -> Result<(), anyhow::Error> {
+    use crate::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    const PRODUCERS: usize = 8;
+    const CONSUMERS: usize = 4;
+    const DURATION_SECS: u64 = 3;
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let produced = Arc::new(AtomicUsize::new(0));
+    let consumed = Arc::new(AtomicUsize::new(0));
+
+    // Channel for passing modules from producers to consumers
+    let (tx, rx) = mpsc::channel::<(Engine, Module)>();
+    let rx = Arc::new(std::sync::Mutex::new(rx));
+
+    eprintln!("Starting producer/consumer collision test");
+
+    // Spawn producers
+    let producer_handles: Vec<_> = (0..PRODUCERS)
+        .map(|_| {
+            let tx = tx.clone();
+            let stop = Arc::clone(&stop);
+            let produced = Arc::clone(&produced);
+            thread::spawn(move || {
+                let mut config = Config::new();
+                config.signals_based_traps(false);
+                let wat = r#"(module (func (export "f")))"#;
+
+                while !stop.load(Ordering::Relaxed) {
+                    let engine = match Engine::new(&config) {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+                    let module = match Module::new(&engine, wat) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+
+                    produced.fetch_add(1, Ordering::Relaxed);
+
+                    // Send to consumer (ignore error if channel closed)
+                    if tx.send((engine, module)).is_err() {
+                        break;
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Drop original sender
+    drop(tx);
+
+    // Spawn consumers
+    let consumer_handles: Vec<_> = (0..CONSUMERS)
+        .map(|_| {
+            let rx = Arc::clone(&rx);
+            let consumed = Arc::clone(&consumed);
+            thread::spawn(move || {
+                loop {
+                    let item = {
+                        let rx = rx.lock().unwrap();
+                        rx.recv()
+                    };
+                    match item {
+                        Ok((engine, module)) => {
+                            // Immediate drop to free address
+                            drop(module);
+                            drop(engine);
+                            consumed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+        })
+        .collect();
+
+    // Run for duration
+    thread::sleep(Duration::from_secs(DURATION_SECS));
+    stop.store(true, Ordering::Relaxed);
+
+    // Wait for all threads
+    for handle in producer_handles {
+        let _ = handle.join();
+    }
+    for handle in consumer_handles {
+        let _ = handle.join();
+    }
+
+    eprintln!(
+        "Producer/consumer test: produced={}, consumed={}",
+        produced.load(Ordering::SeqCst),
+        consumed.load(Ordering::SeqCst)
+    );
 
     Ok(())
 }
