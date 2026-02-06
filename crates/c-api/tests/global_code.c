@@ -113,6 +113,9 @@ static void assert_mapped(uintptr_t addr, const char *context) {
 
 static void note_unmapped_evidence(uintptr_t addr, const char *context) {
 #ifdef __linux__
+  // This checks whether `addr` is still mapped as Linux-only extra evidence;
+  // Wasmtime may legitimately keep mappings cached, but we observed
+  // correlation with GLOBAL_CODE failures.
   if (address_is_mapped(addr)) {
     linux_unmapped_mismatches++;
     fprintf(stderr,
