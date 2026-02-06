@@ -378,3 +378,193 @@ fn test_frame_info() -> Result<(), crate::Error> {
     }
     Ok(())
 }
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_global_code_unregisters_on_module_drop() -> Result<(), crate::Error> {
+    use crate::*;
+
+    for i in 0..600 {
+        let engine = Engine::default();
+        let wat = format!(
+            r#"(module
+                (memory (export "mem") 1)
+                (data (i32.const 0) "{}")
+                (func (export "f"))
+            )"#,
+            i
+        );
+        let module = Module::new(&engine, wat)?;
+        let pc = module.engine_code().text_range().start.raw();
+
+        assert!(lookup_code(pc).is_some());
+
+        drop(module);
+
+        assert!(lookup_code(pc).is_none());
+    }
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_global_code_unregisters_same_module() -> Result<(), crate::Error> {
+    use crate::*;
+
+    let wat = r#"(module (func (export "test") (result i32) i32.const 42))"#;
+
+    for i in 0..500 {
+        let mut config = Config::new();
+        config.signals_based_traps(false);
+        let engine = Engine::new(&config)?;
+        let module = Module::new(&engine, wat)?;
+        let pc = module.engine_code().text_range().start.raw();
+
+        assert!(lookup_code(pc).is_some());
+
+        drop(module);
+
+        assert!(lookup_code(pc).is_none());
+
+        if i % 100 == 0 {
+            eprintln!("Iteration {}", i);
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_global_code_unregisters_same_engine() -> Result<(), crate::Error> {
+    use crate::*;
+
+    let mut config = Config::new();
+    config.signals_based_traps(false);
+    let engine = Engine::new(&config)?;
+    let wat = r#"(module (func (export "test") (result i32) i32.const 42))"#;
+
+    for i in 0..500 {
+        let module = Module::new(&engine, wat)?;
+        let pc = module.engine_code().text_range().start.raw();
+
+        assert!(lookup_code(pc).is_some());
+
+        drop(module);
+
+        assert!(lookup_code(pc).is_none());
+
+        if i % 100 == 0 {
+            eprintln!("Iteration {}", i);
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_global_code_unregisters_under_pressure() -> Result<(), crate::Error> {
+    use crate::*;
+
+    let mut config = Config::new();
+    config.signals_based_traps(false);
+
+    let wat = r#"(module
+        (memory (export "mem") 1)
+        (data (i32.const 0) "pressure")
+        (func (export "test") (result i32) i32.const 42)
+    )"#;
+
+    let mut held_modules: Vec<Module> = Vec::new();
+
+    for i in 0..1000 {
+        let engine = Engine::new(&config)?;
+        let module = Module::new(&engine, wat)?;
+        let pc = module.engine_code().text_range().start.raw();
+
+        assert!(lookup_code(pc).is_some());
+
+        if i % 3 == 0 {
+            held_modules.push(module);
+        } else {
+            drop(module);
+            assert!(lookup_code(pc).is_none());
+        }
+
+        if i % 10 == 0 && !held_modules.is_empty() {
+            let dropped = held_modules.pop().unwrap();
+            let dropped_pc = dropped.engine_code().text_range().start.raw();
+            drop(dropped);
+            assert!(lookup_code(dropped_pc).is_none());
+        }
+    }
+
+    for module in held_modules {
+        let pc = module.engine_code().text_range().start.raw();
+        drop(module);
+        assert!(lookup_code(pc).is_none());
+    }
+
+    Ok(())
+}
+
+#[test]
+#[cfg_attr(miri, ignore)]
+fn test_global_code_unregisters_under_threaded_pressure() -> Result<(), crate::Error> {
+    use crate::*;
+    use std::thread;
+
+    let wat = r#"(module
+        (memory (export "mem") 1)
+        (data (i32.const 0) "threaded")
+        (func (export "test") (result i32) i32.const 42)
+    )"#;
+
+    let mut handles = Vec::new();
+
+    for thread_id in 0..4 {
+        let wat = wat.to_string();
+        handles.push(thread::spawn(move || -> Result<(), crate::Error> {
+            let mut config = Config::new();
+            config.signals_based_traps(false);
+            let mut held_modules: Vec<Module> = Vec::new();
+
+            for i in 0..1000 {
+                let engine = Engine::new(&config)?;
+                let module = Module::new(&engine, &wat)?;
+                let pc = module.engine_code().text_range().start.raw();
+
+                assert!(lookup_code(pc).is_some());
+
+                if (i + thread_id) % 4 == 0 {
+                    held_modules.push(module);
+                } else {
+                    drop(module);
+                    assert!(lookup_code(pc).is_none());
+                }
+
+                if i % 25 == 0 && !held_modules.is_empty() {
+                    let dropped = held_modules.pop().unwrap();
+                    let dropped_pc = dropped.engine_code().text_range().start.raw();
+                    drop(dropped);
+                    assert!(lookup_code(dropped_pc).is_none());
+                }
+            }
+
+            for module in held_modules {
+                let pc = module.engine_code().text_range().start.raw();
+                drop(module);
+                assert!(lookup_code(pc).is_none());
+            }
+
+            Ok(())
+        }));
+    }
+
+    for handle in handles {
+        handle.join().unwrap()?;
+    }
+
+    Ok(())
+}
